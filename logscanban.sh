@@ -3,7 +3,7 @@
 TEMP_FILE=$(mktemp /tmp/tempfile.XXXXXX)
 FILE=/var/log/meinban.txt
 EXCLUDE_IP_FILE=/var/log/exclude_ip.txt
-EXCLUDE_RANGES="38\.23\.160\.|10\.0\.0\.|169\.254\.2\.|169\.254\.4\.|169\.254\.5\."
+EXCLUDE_RANGES="AA\.BB\.CC\.|XX\.YY\.ZZ\.|RRR\.SSS\.TTT\." ### Replace the ranges with the one you want to exclude
 
 NGINX_LOGS=$(ls /var/log/nginx/domains/*.log* | grep -v -E '\.error\.log')
 if [ -n "$NGINX_LOGS" ]; then
