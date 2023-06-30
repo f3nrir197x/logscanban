@@ -29,6 +29,9 @@ zcat -f /var/log/exim4/rejectlog* | grep -Eo "([0-9]{1,3}[\.]){3}[0-9]{1,3}" | s
 zcat -f /var/log/hestia/nginx-access.log* | sed 's/\"//g' | awk '$9 !="200" {print $1}' | grep -Eo "([0-9]{1,3}[\.]){3}[0-9]{1,3}" | sort -u >> $TEMP_FILE
 zcat -f /var/log/hestia/nginx-error.log* | grep -Eo "([0-9]{1,3}[\.]){3}[0-9]{1,3}" | sort -u >> $TEMP_FILE
 
+### Added ban to IPs hitting ssh
+lastb | awk {'print $3'} | grep -Eo "([0-9]{1,3}[\.]){3}[0-9]{1,3}" | sort -u >> $TEMP_FILE
+
 ### Exclude IPs from the exclude file and the specified ranges, then sort, deduplicate and write to the final file:
 grep -v -f $EXCLUDE_IP_FILE $TEMP_FILE | grep -vE $EXCLUDE_RANGES | sort -u > $FILE
 
