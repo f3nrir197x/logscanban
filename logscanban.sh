@@ -4,19 +4,44 @@
 extract_ips() {
     local file=$1
     echo "Processing $file..."
-    zcat -f $file | grep -Eo $IP_REGEX | sort -u >> $TEMP_FILE
+
+    # Define the command to extract IPs based on the file type
+    local cmd
+    if [[ $file == *"auth.log"* ]]; then
+        cmd="zcat -f $file | grep 'nvalid' | grep -Eo $IP_REGEX"
+    elif [[ $file == *"dovecot.log"* ]]; then
+        cmd="zcat -f $file | grep -E 'error|no\ auth' | grep -Eo $IP_REGEX"
+    elif [[ $file == *"exim4/mainlog"* ]]; then
+        cmd="zcat -f $file | grep -v 'Connection timed out' | grep -Eo $IP_REGEX"
+    elif [[ $file == *"exim4/rejectlog"* ]]; then
+        cmd="zcat -f $file | grep -v warez.pe | grep -Eo $IP_REGEX"
+    elif [[ $file == *"hestia/nginx-access.log"* ]]; then
+        cmd="zcat -f $file | awk '($9 !~ /^\"2/ && $9 !~ /^\"5/) {print}' | grep -Eo $IP_REGEX"
+    else
+        cmd="zcat -f $file | grep -Eo $IP_REGEX"
+    fi
+
+    # Run the command and append the output to the temporary file
+    local ips=$($cmd)
     if [ $? -ne 0 ]; then
-        echo "Error extracting IPs from $file"
+        echo "Error running command: $cmd"
+        exit 1
+    fi
+
+    echo "$ips" | sort -u >> $TEMP_FILE
+    if [ $? -ne 0 ]; then
+        echo "Error writing to $TEMP_FILE"
         exit 1
     fi
 }
+
 
 # Function to process nginx/apache logs
 process_logs() {
     local log_dir=$1
     local logs=$(ls $log_dir | grep -v -E '\.error\.log')
     if [ -n "$logs" ]; then
-        zcat -f $logs | awk '$9 != 200 && $9 != 500 {print $1}' | sort -u >> $TEMP_FILE
+        zcat -f $logs | awk '($9 !~ /^2/ && $9 !~ /^5/){print $1}' | sort -u >> $TEMP_FILE
         if [ $? -ne 0 ]; then
             echo "Error processing logs from $log_dir"
             exit 1
