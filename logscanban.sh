@@ -16,7 +16,7 @@ extract_ips() {
     elif [[ $file == *"exim4/rejectlog"* ]]; then
         cmd="zcat -f $file | grep -v warez.pe | grep -Eo $IP_REGEX"
     elif [[ $file == *"hestia/nginx-access.log"* ]]; then
-        cmd="zcat -f $file | awk '($9 !~ /^\"2/ && $9 !~ /^\"5/) {print}' | grep -Eo $IP_REGEX"
+        cmd="zcat -f $file | awk '($9 !~ /^\"2/ && $9 !~ /^\"5/) {print $1}' | grep -Eo $IP_REGEX"
     else
         cmd="zcat -f $file | grep -Eo $IP_REGEX"
     fi
@@ -34,7 +34,6 @@ extract_ips() {
         exit 1
     fi
 }
-
 
 # Function to process nginx/apache logs
 process_logs() {
@@ -87,8 +86,8 @@ done
 process_logs "/var/log/nginx/domains/*.log*"
 process_logs "/var/log/apache2/domains/*.log*"
 
-# Check logs for hestia/nginx
-zcat -f /var/log/hestia/nginx-access.log* | sed 's/\"//g' | awk '$9 !="200" {print $1}' | grep -Eo $IP_REGEX | sort -u >> $TEMP_FILE
+# Check logs for hestia/nginx || Removed as it is already handled
+### zcat -f /var/log/hestia/nginx-access.log* | sed 's/\"//g' | awk '$9 !="200" {print $1}' | grep -Eo $IP_REGEX | sort -u >> $TEMP_FILE
 
 ### Added ban to IPs hitting ssh
 lastb | awk {'print $3'} | grep -Eo $IP_REGEX | sort -u >> $TEMP_FILE
