@@ -14,7 +14,7 @@ extract_ips() {
     elif [[ $file == *"exim4/mainlog"* ]]; then
         cmd="zcat -f $file | grep -v 'Connection timed out' | grep -Eo $IP_REGEX"
     elif [[ $file == *"exim4/rejectlog"* ]]; then
-        cmd="zcat -f $file | grep -v warez.pe | grep -Eo $IP_REGEX"
+        cmd="zcat -f $file | grep -Eo $IP_REGEX"
     elif [[ $file == *"hestia/nginx-access.log"* ]]; then
         cmd="zcat -f $file | awk '($9 !~ /^\"2/ && $9 !~ /^\"5/) {print $1}' | grep -Eo $IP_REGEX"
     else
