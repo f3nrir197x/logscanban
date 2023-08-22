@@ -1,30 +1,40 @@
 #!/bin/bash
 
+#
+# 2023-AUG-22: Added Geo IP location to withpath.txt
+# Prerequisite is to have geoiplookup installed:
+# apt install geoip-bin
+#
+
 # Define a function to extract unique IP addresses from a file
-# This version outputs the 
 extract_ips() {
     local file_pattern=$1
     for log in $file_pattern; do
         echo "Processing $log..."
         if [[ $log == *"auth.log"* ]]; then
             zcat -f "$log" | grep 'nvalid' | grep -Eo $IP_REGEX | while read -r ip; do
-                echo "$ip | $log" >> $TEMP_FILE
+		geo=$(geoiplookup $ip | awk -F":" '{print $2}')
+                echo "$ip | $log |$geo" >> $TEMP_FILE
             done
         elif [[ $log == *"dovecot.log"* ]]; then
             zcat -f "$log" | grep -E 'error|no\ auth' | grep -Eo $IP_REGEX | while read -r ip; do
-                echo "$ip | $log" >> $TEMP_FILE
+                geo=$(geoiplookup $ip | awk -F":" '{print $2}')
+                echo "$ip | $log |$geo" >> $TEMP_FILE
             done
         elif [[ $log == *"exim4/mainlog"* ]]; then
             zcat -f "$log" | grep -v 'Connection timed out' | grep -Eo $IP_REGEX | while read -r ip; do
-                echo "$ip | $log" >> $TEMP_FILE
+                geo=$(geoiplookup $ip | awk -F":" '{print $2}')
+                echo "$ip | $log |$geo" >> $TEMP_FILE
             done
         elif [[ $log == *"hestia/nginx-access.log"* ]]; then
             zcat -f "$log" | awk '($9 !~ /^"2/ && $9 !~ /^"5/) {print $1}' | grep -Eo $IP_REGEX | while read -r ip; do
-                echo "$ip | $log" >> $TEMP_FILE
+                geo=$(geoiplookup $ip | awk -F":" '{print $2}')
+                echo "$ip | $log |$geo" >> $TEMP_FILE
             done
         else
             zcat -f "$log" | grep -Eo $IP_REGEX | while read -r ip; do
-                echo "$ip | $log" >> $TEMP_FILE
+                geo=$(geoiplookup $ip | awk -F":" '{print $2}')
+                echo "$ip | $log |$geo" >> $TEMP_FILE
             done
         fi
     done
@@ -34,14 +44,16 @@ process_logs() {
     local log_dir_pattern=$1
     for log in $log_dir_pattern; do
         zcat -f "$log" | awk '($9 !~ /^2/ && $9 !~ /^5/){print $1}' | grep -Eo $IP_REGEX | while read -r ip; do
-            echo "$ip | $log" >> $TEMP_FILE
+            geo=$(geoiplookup $ip | awk -F":" '{print $2}')
+            echo "$ip | $log |$geo" >> $TEMP_FILE
         done
     done
 }
 
+### IP_REGEX="([0-9]{1,3}[\.]){3}[0-9]{1,3}"
 IP_REGEX="((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)"
 TEMP_FILE=$(mktemp /tmp/tempfile.XXXXXX)
-TRAIL=~/withpath.txt
+TRAIL=/root/withpath.txt
 FILE=/var/log/meinban.txt
 EXCLUDE_IP_FILE=/var/log/exclude_ip.txt
 EXCLUDE_RANGES="XXX\.YYY\.ZZZ\.|AAA\.BBB\.CCC\.|MM\.NN\.PP\." ###Replace this with the networks to be excluded
@@ -70,13 +82,14 @@ process_logs "/var/log/apache2/domains/*.log*"
 
 ### Added ban to IPs hitting ssh
 lastb | awk {'print $3'} | grep -Eo $IP_REGEX | while read -r ip; do
-    echo "$ip | /var/log/btmp" >> $TEMP_FILE
+    geo=$(geoiplookup $ip | awk -F":" '{print $2}')
+    echo "$ip | /var/log/btmp |$geo" >> $TEMP_FILE
 done
 
-### Create a file with both offending IP addresses and logfile where they were found. Some duplicates may appear
+### Filter known and authorized IPs and create a file with both offending IP addresses and logfile where they were found. Some duplicates may happen
 grep -v -f $EXCLUDE_IP_FILE $TEMP_FILE | grep -vE $EXCLUDE_RANGES | sort -u > $TRAIL
 
-### Exclude IPs from the exclude file and the specified ranges, then sort, deduplicate and write to the final file:
+### Write to the final file:
 cat $TRAIL | awk -F"|" '{print $1}' | sort -u > $FILE
 
 # Remove the temporary file:
