@@ -64,6 +64,7 @@
 #   recent - scan only live logs, and only the bytes added since last run
 
 set -u
+set -o pipefail
 
 ###############################################################################
 # CONFIGURATION - adjust to your environment
@@ -105,7 +106,7 @@ if [[ "$SCAN_TYPE" != "full" && "$SCAN_TYPE" != "recent" ]]; then
     exit 1
 fi
 
-mkdir -p "$STATE_DIR/offsets"
+mkdir -p "$STATE_DIR/offsets" "$(dirname "$TRAIL")" "$(dirname "$FILE")" "$(dirname "$EXCLUDE_IP_FILE")"
 touch "$GEO_CACHE" "$TRAIL" "$FILE"
 [[ -f "$EXCLUDE_IP_FILE" ]] || touch "$EXCLUDE_IP_FILE"
 
@@ -181,11 +182,11 @@ scan_pattern() {
         echo "Processing $log..."
         case "$log" in
             *auth.log*)
-                read_log "$log" | grep 'nvalid' ;;
+                read_log "$log" | { grep 'nvalid' || true; } ;;
             *dovecot.log*)
-                read_log "$log" | grep -E 'error|no auth' ;;
+                read_log "$log" | { grep -E 'error|no auth' || true; } ;;
             *exim4/mainlog*)
-                read_log "$log" | grep -v 'Connection timed out' ;;
+                read_log "$log" | { grep -v 'Connection timed out' || true; } ;;
             *hestia/nginx-access.log*)
                 # access log: keep requests whose status is not 2xx/5xx
                 read_log "$log" | awk '($9 !~ /^"?2/ && $9 !~ /^"?5/) {print $1}' ;;
@@ -193,7 +194,7 @@ scan_pattern() {
                 read_log "$log" | awk '($9 !~ /^"?2/ && $9 !~ /^"?5/) {print $1}' ;;
             *)
                 read_log "$log" ;;
-        esac | grep -Eo "$IP_REGEX" | awk -v l="$log" '{print $0 "\t" l}' >> "$RAW_IPS"
+        esac | { grep -Eo "$IP_REGEX" || true; } | awk -v l="$log" '{print $0 "\t" l}' >> "$RAW_IPS"
     done
 }
 
@@ -241,7 +242,7 @@ done
 # and fall back to a plain lastb on older systems. Also make sure btmp is in
 # your logrotate config - that is the real fix for its size.
 { lastb --since "-${RETENTION_DAYS}days" 2>/dev/null || lastb; } \
-    | awk '{print $3}' | grep -Eo "$IP_REGEX" \
+    | awk '{print $3}' | { grep -Eo "$IP_REGEX" || true; } \
     | awk '{print $0 "\t/var/log/btmp"}' >> "$RAW_IPS"
 
 ###############################################################################
@@ -253,14 +254,19 @@ done
 # NB: we key on FILENAME rather than the usual NR==FNR idiom, because with an
 # EMPTY exclude file NR==FNR would stay true into the second input and every
 # candidate would be silently swallowed as an "exclusion".
-sort "$RAW_IPS" | uniq \
+sort -u "$RAW_IPS" \
     | awk -F'\t' -v ex="$EXCLUDE_IP_FILE" \
         'FILENAME == ex { skip[$1]=1; next } !($1 in skip)' "$EXCLUDE_IP_FILE" - \
-    | grep -vE "$EXCLUDE_RANGES" > "$CANDIDATES"
+    > "$WORKDIR/cand.premask"
+if [[ -n "$EXCLUDE_RANGES" ]]; then
+    grep -vE "^($EXCLUDE_RANGES)" "$WORKDIR/cand.premask" > "$CANDIDATES" || true
+else
+    cp "$WORKDIR/cand.premask" "$CANDIDATES"
+fi
 
 # Hit threshold (reason #8): count how often each IP appeared across ALL logs
 # this run; keep only those with >= MIN_HITS occurrences.
-awk -F'\t' '{count[$1]++} END {for (ip in count) if (count[ip] >= '"$MIN_HITS"') print ip}' \
+awk -F'\t' -v min="$MIN_HITS" '{count[$1]++} END {for (ip in count) if (count[ip] >= min) print ip}' \
     "$RAW_IPS" | sort > "$WORKDIR/over_threshold.txt"
 
 # An IP makes the final list if it survived the exclusions AND the threshold.
@@ -306,8 +312,12 @@ awk -F'|' -v cutoff="$CUTOFF" -v ex="$EXCLUDE_IP_FILE" '
         ip=$1; gsub(/[ \t]/, "", ip)
         if (d >= cutoff && !(ip in skip)) print
     }
-' "$EXCLUDE_IP_FILE" "$TRAIL" \
-    | grep -vE "^($EXCLUDE_RANGES)" > "$WORKDIR/trail.pruned" || true
+' "$EXCLUDE_IP_FILE" "$TRAIL" > "$WORKDIR/trail.premask"
+if [[ -n "$EXCLUDE_RANGES" ]]; then
+    grep -vE "^($EXCLUDE_RANGES)" "$WORKDIR/trail.premask" > "$WORKDIR/trail.pruned" || true
+else
+    cp "$WORKDIR/trail.premask" "$WORKDIR/trail.pruned"
+fi
 
 # 2) Append this run's findings. We only do the geo lookup for IPs we have
 #    not already got in the pruned trail, to keep the loop short. All joins
@@ -321,26 +331,30 @@ awk -F'\t' '
     ($1 in want) && !seen[$1]++ { print }   # first matching candidate line
 ' "$NEW_BANS" "$CANDIDATES" > "$WORKDIR/new_with_log.txt"
 
+# Filter out IPs already present in the pruned trail using an awk set
+# lookup (O(n)) instead of a per-IP grep (O(n²)).
+awk -F'\t' -v kf="$WORKDIR/known_ips.txt" '
+    FILENAME == kf { known[$1]=1; next }
+    !($1 in known)
+' "$WORKDIR/known_ips.txt" "$WORKDIR/new_with_log.txt" |
 while IFS=$'\t' read -r ip log; do
-    if ! grep -qxF "$ip" "$WORKDIR/known_ips.txt"; then
-        echo "$ip | $log | $(geo_of "$ip") | $TSTAMP" >> "$WORKDIR/trail.pruned"
-    fi
-done < "$WORKDIR/new_with_log.txt"
+    echo "$ip | $log | $(geo_of "$ip") | $TSTAMP" >> "$WORKDIR/trail.pruned"
+done
 
 sort -o "$WORKDIR/trail.pruned" "$WORKDIR/trail.pruned"
-cp "$WORKDIR/trail.pruned" "$TRAIL"
+cp "$WORKDIR/trail.pruned" "$TRAIL.tmp" && mv "$TRAIL.tmp" "$TRAIL"
 
 # 3) meinban.txt is now simply DERIVED from the pruned trail, so it shrinks
 #    automatically as old entries age out - this is what stops the unbounded
 #    growth you were seeing.
-awk -F'|' '{gsub(/[ \t]/,"",$1); print $1}' "$TRAIL" | sort -u > "$FILE"
+awk -F'|' '{gsub(/[ \t]/,"",$1); print $1}' "$TRAIL" | sort -u > "$FILE.tmp" && mv "$FILE.tmp" "$FILE"
 echo "Ban list now contains $(wc -l < "$FILE") IPs (retention ${RETENTION_DAYS}d)."
 
 ###############################################################################
 # APPLY BANS VIA IPSET (reason #1 and #5)
 ###############################################################################
 
-if [[ "$APPLY_BANS" == "1" ]] && command -v ipset >/dev/null 2>&1; then
+if [[ "$APPLY_BANS" == "1" ]] && command -v ipset >/dev/null 2>&1 && command -v iptables >/dev/null 2>&1; then
     # Create the sets if missing. "timeout" gives every entry a default TTL;
     # the kernel removes expired entries on its own - no cleanup job needed.
     ipset create "$IPSET_NAME"     hash:ip  timeout "$BAN_TIMEOUT" -exist
@@ -384,7 +398,7 @@ if [[ "$APPLY_BANS" == "1" ]] && command -v ipset >/dev/null 2>&1; then
     # (ipset save > /etc/ipset.conf + a small systemd unit / netfilter-persistent),
     # or just rely on the next cron run to repopulate the set.
 else
-    echo "ipset not applied (APPLY_BANS=$APPLY_BANS or ipset missing)."
+    echo "ipset not applied (APPLY_BANS=$APPLY_BANS, or ipset/iptables missing)."
     echo "You can still feed $FILE to Hestia/Fail2Ban as before."
 fi
 
