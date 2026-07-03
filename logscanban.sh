@@ -250,8 +250,12 @@ done
 
 # Exact-match exclusion (reason #6): load excluded IPs into an awk set and
 # compare the whole IP field, then apply the anchored range regex.
+# NB: we key on FILENAME rather than the usual NR==FNR idiom, because with an
+# EMPTY exclude file NR==FNR would stay true into the second input and every
+# candidate would be silently swallowed as an "exclusion".
 sort "$RAW_IPS" | uniq \
-    | awk -F'\t' 'NR==FNR { skip[$1]=1; next } !($1 in skip)' "$EXCLUDE_IP_FILE" - \
+    | awk -F'\t' -v ex="$EXCLUDE_IP_FILE" \
+        'FILENAME == ex { skip[$1]=1; next } !($1 in skip)' "$EXCLUDE_IP_FILE" - \
     | grep -vE "$EXCLUDE_RANGES" > "$CANDIDATES"
 
 # Hit threshold (reason #8): count how often each IP appeared across ALL logs
@@ -292,9 +296,18 @@ CUTOFF=$(date -d "-${RETENTION_DAYS} days" +"%Y-%m-%d")
 
 # 1) Prune the trail: keep only lines whose date field (4th "|" field) is
 #    within the retention window. YYYY-MM-DD compares correctly as a string.
-awk -F'|' -v cutoff="$CUTOFF" '
-    { d=$4; gsub(/^[ \t]+|[ \t]+$/, "", d); if (d >= cutoff) print }
-' "$TRAIL" > "$WORKDIR/trail.pruned" || true
+#    Exclusions are applied here too, so adding an IP to the exclude file
+#    RETROACTIVELY removes it from the lists on the next run - otherwise a
+#    mistakenly banned IP would linger for the full retention period.
+awk -F'|' -v cutoff="$CUTOFF" -v ex="$EXCLUDE_IP_FILE" '
+    FILENAME == ex { skip[$1]=1; next }
+    {
+        d=$4; gsub(/^[ \t]+|[ \t]+$/, "", d)
+        ip=$1; gsub(/[ \t]/, "", ip)
+        if (d >= cutoff && !(ip in skip)) print
+    }
+' "$EXCLUDE_IP_FILE" "$TRAIL" \
+    | grep -vE "^($EXCLUDE_RANGES)" > "$WORKDIR/trail.pruned" || true
 
 # 2) Append this run's findings. We only do the geo lookup for IPs we have
 #    not already got in the pruned trail, to keep the loop short. All joins
@@ -339,6 +352,13 @@ if [[ "$APPLY_BANS" == "1" ]] && command -v ipset >/dev/null 2>&1; then
         || iptables -I INPUT -m set --match-set "$IPSET_NAME" src -j DROP
     iptables -C INPUT -m set --match-set "$IPSET_NET_NAME" src -j DROP 2>/dev/null \
         || iptables -I INPUT -m set --match-set "$IPSET_NET_NAME" src -j DROP
+
+    # Excluded IPs are purged from the on-disk lists above, but an entry
+    # already in the kernel set would otherwise live until its TTL expires.
+    # Delete them explicitly so exclusion takes effect immediately.
+    while read -r ip; do
+        [[ -n "$ip" ]] && ipset del "$IPSET_NAME" "$ip" 2>/dev/null
+    done < "$EXCLUDE_IP_FILE"
 
     # Subnet aggregation (reason #5): if SUBNET_THRESHOLD+ distinct IPs share
     # a /24, ban the whole /24 with a single hash:net entry.
