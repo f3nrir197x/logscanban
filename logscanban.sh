@@ -71,7 +71,10 @@ set -o pipefail
 ###############################################################################
 
 RETENTION_DAYS=14            # drop list entries older than this
-BAN_TIMEOUT=$((RETENTION_DAYS * 86400))  # ipset entry lifetime, in seconds
+# (BAN_TIMEOUT, the ipset entry lifetime, is derived from RETENTION_DAYS
+#  below, AFTER the local config override - so overriding RETENTION_DAYS in
+#  /etc/logscanban.conf keeps both in sync. Set BAN_TIMEOUT in the conf only
+#  if you deliberately want them to differ.)
 MIN_HITS=1                   # appearances required before an IP is banned
 SUBNET_THRESHOLD=10          # distinct IPs from one /24 -> ban whole /24
 APPLY_BANS=1                 # 1 = manage ipset/iptables directly from here;
@@ -100,6 +103,22 @@ IPSET_NET_NAME=logscanban_net        # hash:net set for aggregated /24s
 # Anchored IP regex (word boundaries) so we never grab fragments of longer
 # numeric strings.
 IP_REGEX="\b((25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\.){3}(25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\b"
+
+###############################################################################
+# LOCAL CONFIG OVERRIDE
+###############################################################################
+# Everything above is a DEFAULT. Per-server values belong in /etc/logscanban.conf
+# (plain bash assignments, e.g. EXCLUDE_RANGES="^10\." or DDNS_HOSTS="home.x.org"),
+# which is sourced here and overrides the defaults. This keeps the script file
+# itself identical on every server, so "git pull" never conflicts with local
+# configuration again. The conf file is not part of the repo - create it once
+# per server and updates will never touch it.
+CONF_FILE=/etc/logscanban.conf
+[[ -f "$CONF_FILE" ]] && . "$CONF_FILE"
+
+# Derive BAN_TIMEOUT from (possibly overridden) RETENTION_DAYS, unless the
+# conf file set BAN_TIMEOUT explicitly.
+BAN_TIMEOUT="${BAN_TIMEOUT:-$((RETENTION_DAYS * 86400))}"
 
 ###############################################################################
 # ARGUMENTS / SETUP

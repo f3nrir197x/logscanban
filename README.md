@@ -122,6 +122,27 @@ it can ban **your own IP**, your monitoring systems, or your office network.
 | `APPLY_BANS` | `1` | `1` = the script manages ipset/iptables itself. `0` = it only writes the list files and you feed them to Hestia/Fail2Ban/iptables yourself (see *Integrations*). |
 | `DDNS_HOSTS` | *(empty)* | Space-separated DDNS hostnames (e.g. your home connection). Resolved to their current IPs on every run and excluded like `exclude_ip.txt` entries — a dynamic home IP stays excluded even after it changes. Empty = feature off. See *Dynamic DNS exclusions* below. |
 
+#### Per-server configuration file (recommended for multi-server deployments)
+
+The values in the script are **defaults**. Put your per-server values in
+`/etc/logscanban.conf` (plain bash assignments) and they override the
+defaults at startup:
+
+```bash
+cat > /etc/logscanban.conf <<'EOF'
+EXCLUDE_RANGES="^10\.|^192\.168\."
+DDNS_HOSTS="home.example.org"
+MIN_HITS=2
+EOF
+```
+
+The conf file is not part of the repo, so the deployed script stays
+identical to the repository on every server — `git pull` updates never
+conflict with local configuration. `BAN_TIMEOUT` is derived from
+`RETENTION_DAYS` *after* the conf is read, so overriding `RETENTION_DAYS`
+keeps both in sync automatically; set `BAN_TIMEOUT` in the conf only if you
+deliberately want them to differ.
+
 ### 3. Dynamic DNS exclusions
 
 If you reach your servers from a connection with a dynamic IP, point a DDNS
@@ -254,6 +275,7 @@ tool's responsibility.
 | `/var/log/meinban.txt` | Current ban list, one IP per line (rebuilt every run) |
 | `/root/withpath.txt` | Detailed trail: `ip \| source log \| geo \| timestamp` |
 | `/var/log/exclude_ip.txt` | Your allowlist, one IP per line |
+| `/etc/logscanban.conf` | Optional per-server config overriding the script's defaults (not in the repo) |
 | `/var/lib/logscanban/offsets/` | Per-log read offsets for incremental scans |
 | `/var/lib/logscanban/geocache.txt` | Cached GeoIP lookups (one lookup per IP, ever) |
 | `/var/lib/logscanban/ddns_<host>.txt` | Last successful DDNS resolution per hostname (fallback cache) |
