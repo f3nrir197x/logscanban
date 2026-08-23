@@ -16,24 +16,24 @@ offenders are effectively blocked forever, while one-off scanners age out.
 ## How it works
 
 1. **Scan** — the script reads the configured log files and applies a
-  per-service filter (e.g. `Invalid user` lines in `auth.log`, non-2xx/5xx
-  requests in access logs) to find offending IP addresses. Failed SSH logins
-  recorded in `/var/log/btmp` are included via `lastb`.
+   per-service filter (e.g. `Invalid user` lines in `auth.log`, non-2xx/5xx
+   requests in access logs) to find offending IP addresses. Failed SSH logins
+   recorded in `/var/log/btmp` are included via `lastb`.
 2. **Filter** — IPs listed in the exclude file, IPs in excluded network
-  ranges, and IPs seen fewer than `MIN_HITS` times are dropped.
+   ranges, and IPs seen fewer than `MIN_HITS` times are dropped.
 3. **Record** — surviving IPs are written to two files:
-  - `/var/log/meinban.txt` — plain list, one IP per line (this is the file
-    you feed to other tools if you don't want the script to manage the
-    firewall itself).
-  - `/root/withpath.txt` — detailed trail: IP, the log it was found in, its
-    GeoIP country, and a timestamp. Entries older than `RETENTION_DAYS` are
-    pruned on every run, and `meinban.txt` is rebuilt from this pruned
-    trail — that is what keeps the list from growing forever.
+   - `/var/log/meinban.txt` — plain list, one IP per line (this is the file
+     you feed to other tools if you don't want the script to manage the
+     firewall itself).
+   - `/root/withpath.txt` — detailed trail: IP, the log it was found in, its
+     GeoIP country, and a timestamp. Entries older than `RETENTION_DAYS` are
+     pruned on every run, and `meinban.txt` is rebuilt from this pruned
+     trail — that is what keeps the list from growing forever.
 4. **Ban** — every IP is added to an ipset named `logscanban` with a TTL of
-  `RETENTION_DAYS`. A single iptables rule drops all traffic matching the
-  set. If `SUBNET_THRESHOLD` or more distinct IPs come from the same /24,
-  the whole /24 is banned with one entry in a second set
-  (`logscanban_net`) instead.
+   `RETENTION_DAYS`. A single iptables rule drops all traffic matching the
+   set. If `SUBNET_THRESHOLD` or more distinct IPs come from the same /24,
+   the whole /24 is banned with one entry in a second set
+   (`logscanban_net`) instead.
 
 ### Why ipset instead of one iptables rule per IP?
 
@@ -53,6 +53,9 @@ This is the same mechanism Fail2Ban uses in its ipset mode.
 - `geoip-bin` — `apt install geoip-bin` (provides `geoiplookup` for the
   country column in the trail file; the script still works without it, the
   geo column will just read "unknown")
+- `dnsutils` — `apt install dnsutils` (provides `dig`, used only if you set
+  `DDNS_HOSTS`; without it the script falls back to `getent`, which respects
+  local DNS caching and may return staler results than the DDNS TTL)
 - Root privileges (reads protected logs, manages iptables/ipset)
 - `flock` and `lastb` (part of util-linux, present on virtually every system)
 
@@ -68,7 +71,7 @@ git clone https://github.com/f3nrir197x/logscanban.git
 cd logscanban
 chmod +x logscanban.sh
 cp logscanban.sh /usr/local/sbin/
-apt install ipset geoip-bin
+apt install ipset geoip-bin dnsutils
 ```
 
 Then, **before the first run**, do the three configuration steps below.
@@ -87,24 +90,23 @@ it can ban **your own IP**, your monitoring systems, or your office network.
 - `EXCLUDE_IP_FILE` (default `/var/log/exclude_ip.txt`): one IP per line,
   matched **exactly**. Put your home/office IPs and any monitoring probes
   here. Create the file even if it's empty:
-  
+
   ```bash
   cat > /var/log/exclude_ip.txt <<EOF
   203.0.113.10
   198.51.100.25
   EOF
   ```
-  
+
 - `EXCLUDE_RANGES`: a regex of network prefixes to skip, anchored at the
   start of the IP. Replace the `XXX\.YYY\.ZZZ\.` placeholders with your real
   networks, e.g. to exclude 10.x.x.x and 192.168.x.x:
-  
+
   ```bash
   EXCLUDE_RANGES="^10\.|^192\.168\."
   ```
-  
+
   **The script will not work correctly until the placeholder is replaced.**
-  
 
 > Tip: before letting the script touch the firewall, do a dry run with
 > `APPLY_BANS=0` and review `/var/log/meinban.txt`. If your own IP is in
@@ -113,13 +115,37 @@ it can ban **your own IP**, your monitoring systems, or your office network.
 ### 2. Tunables
 
 | Variable | Default | Meaning |
-| --- | --- | --- |
+|---|---|---|
 | `RETENTION_DAYS` | `14` | How long a ban lives, both in the on-disk lists and in the kernel ipset. Raise for stickier bans, lower for a smaller list. |
 | `MIN_HITS` | `1` | How many times an IP must appear across all logs in one run before it is banned. Raise to `2`–`3` to avoid banning a legitimate user for a single typo'd password. |
 | `SUBNET_THRESHOLD` | `10` | If this many distinct banned IPs share a /24, the whole /24 is banned with a single entry. Lower = more aggressive. |
 | `APPLY_BANS` | `1` | `1` = the script manages ipset/iptables itself. `0` = it only writes the list files and you feed them to Hestia/Fail2Ban/iptables yourself (see *Integrations*). |
+| `DDNS_HOSTS` | *(empty)* | Space-separated DDNS hostnames (e.g. your home connection). Resolved to their current IPs on every run and excluded like `exclude_ip.txt` entries — a dynamic home IP stays excluded even after it changes. Empty = feature off. See *Dynamic DNS exclusions* below. |
 
-### 3. Log paths
+### 3. Dynamic DNS exclusions
+
+If you reach your servers from a connection with a dynamic IP, point a DDNS
+hostname at it and set:
+
+```bash
+DDNS_HOSTS="home.example.org"
+```
+
+Each run resolves the hostname and excludes its current IP(s), both
+prospectively (never banned) and retroactively (purged from the lists and
+the kernel set if it was banned before the record updated). The last
+successful resolution is cached in `/var/lib/logscanban/`, so a transient
+DNS failure keeps the exclusion alive (a warning is printed).
+
+**Caveat:** between your IP changing and the DDNS record updating, the
+stale IP is the one excluded. This only matters if you also trip the
+detection patterns from the new IP during that window — a failed login
+(`MIN_HITS` times within one scan) or web requests returning errors like
+404s. With key-based SSH and `MIN_HITS` of 2 or more, the realistic
+lockout risk is low, but keep an out-of-band access path (provider
+console) available rather than relying on this as your only guard.
+
+### 4. Log paths
 
 The `LOG_PATTERNS` arrays list which logs are scanned. The defaults match a
 HestiaCP server (nginx, apache2, auth, dovecot, exim4, hestia). Remove
@@ -167,19 +193,17 @@ next `recent` from cron); the second invocation simply exits.
 ipset contents live in kernel memory and are **lost on reboot**. Two options:
 
 1. **Do nothing** — the on-disk files persist, so the first cron run after
-  boot repopulates the set. Acceptable if a few minutes of unbanned window
-  after a reboot is fine for you (it usually is).
-  
+   boot repopulates the set. Acceptable if a few minutes of unbanned window
+   after a reboot is fine for you (it usually is).
 2. **Persist the set** — save and restore it explicitly:
-  
-  ```bash
-  ipset save > /etc/ipset.conf
-  ```
-  
-  and restore at boot before iptables rules load, e.g. with
-  `netfilter-persistent` (`apt install ipset-persistent`) or a small
-  systemd unit running `ipset restore < /etc/ipset.conf`.
-  
+
+   ```bash
+   ipset save > /etc/ipset.conf
+   ```
+
+   and restore at boot before iptables rules load, e.g. with
+   `netfilter-persistent` (`apt install ipset-persistent`) or a small
+   systemd unit running `ipset restore < /etc/ipset.conf`.
 
 The single iptables rule referencing the set also needs to survive reboots —
 `iptables-persistent` handles that, or just let the script re-create it on
@@ -226,12 +250,13 @@ tool's responsibility.
 ## Files used by the script
 
 | Path | Purpose |
-| --- | --- |
+|---|---|
 | `/var/log/meinban.txt` | Current ban list, one IP per line (rebuilt every run) |
-| `/root/withpath.txt` | Detailed trail: `ip \\| source log \\| geo \\| timestamp` |
+| `/root/withpath.txt` | Detailed trail: `ip \| source log \| geo \| timestamp` |
 | `/var/log/exclude_ip.txt` | Your allowlist, one IP per line |
 | `/var/lib/logscanban/offsets/` | Per-log read offsets for incremental scans |
 | `/var/lib/logscanban/geocache.txt` | Cached GeoIP lookups (one lookup per IP, ever) |
+| `/var/lib/logscanban/ddns_<host>.txt` | Last successful DDNS resolution per hostname (fallback cache) |
 | `/run/logscanban.lock` | Lock file preventing parallel runs |
 
 Everything under `/var/lib/logscanban` can be deleted safely at any time —
@@ -244,23 +269,21 @@ offsets are re-established).
 
 - **nftables-only systems:** replace the ipset/iptables block with a native
   nft set, which supports timeouts the same way:
-  
+
   ```bash
   nft add table inet filter
   nft add set inet filter logscanban '{ type ipv4_addr; flags timeout; }'
   nft add rule inet filter input ip saddr @logscanban drop
   nft add element inet filter logscanban "{ $IP timeout ${BAN_TIMEOUT}s }"
   ```
-  
+
 - **IPv6:** the script currently extracts IPv4 only. For IPv6 you would add
   an IPv6 regex, a `hash:ip family inet6` set, and matching `ip6tables`
   rules.
-  
 - **btmp growth:** `lastb` reads `/var/log/btmp` in full on older systems.
   Make sure btmp is rotated (Debian/Ubuntu do this by default in
   `/etc/logrotate.conf`); the script also uses `lastb --since` to limit the
   window where util-linux supports it.
-  
 
 ---
 

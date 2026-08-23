@@ -84,6 +84,11 @@ EXCLUDE_IP_FILE=/var/log/exclude_ip.txt   # one IP per line, exact match
 EXCLUDE_RANGES="^XXX\.YYY\.ZZZ\.|^AAA\.BBB\.CCC\."  # regex of prefixes to skip
                              # NOTE: anchored with ^ so "10.20." cannot
                              # accidentally match "110.20." anymore.
+DDNS_HOSTS=""                # space-separated DDNS hostnames (e.g. your home
+                             # connection). Resolved to their CURRENT IPs on
+                             # every run and excluded like exclude_ip.txt
+                             # entries - so a dynamic home IP stays excluded
+                             # even after it changes. Empty = feature off.
 
 STATE_DIR=/var/lib/logscanban        # offsets + geo cache live here
 GEO_CACHE=$STATE_DIR/geocache.txt    # "ip<TAB>geo" pairs, reused across runs
@@ -125,6 +130,29 @@ RAW_IPS="$WORKDIR/raw_ips.txt"           # "ip<TAB>logfile", one per match
 CANDIDATES="$WORKDIR/candidates.txt"     # unique ip+log after filtering
 NEW_BANS="$WORKDIR/new_bans.txt"         # final unique IPs this run
 : > "$RAW_IPS"
+
+# --- Dynamic DNS exclusions --------------------------------------------------
+# Resolve each DDNS hostname to its current IPv4 address(es) and treat them
+# like exclude_ip.txt entries for this run. A cache of the last successful
+# resolution per host is kept in STATE_DIR so a transient DNS failure does
+# not silently drop the exclusion (which could get your home IP banned).
+# CAVEAT: if your IP changed but the DDNS record hasn't updated yet, the
+# stale IP is excluded for that window - keep an out-of-band access path.
+DYN_EXCLUDE="$WORKDIR/dyn_exclude.txt"
+: > "$DYN_EXCLUDE"
+for host in $DDNS_HOSTS; do
+    dnscache="$STATE_DIR/ddns_${host//\//_}.txt"
+    ips=$(dig +short "$host" A 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+    [[ -z "$ips" ]] && ips=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1}' | sort -u)
+    if [[ -n "$ips" ]]; then
+        echo "$ips" | tee "$dnscache" >> "$DYN_EXCLUDE"    # refresh cache
+    elif [[ -s "$dnscache" ]]; then
+        cat "$dnscache" >> "$DYN_EXCLUDE"                  # DNS down: use last known
+        echo "WARN: could not resolve $host, using cached IP(s)" >&2
+    else
+        echo "WARN: could not resolve $host and no cache exists" >&2
+    fi
+done
 
 ###############################################################################
 # LOG READING
@@ -255,8 +283,9 @@ done
 # EMPTY exclude file NR==FNR would stay true into the second input and every
 # candidate would be silently swallowed as an "exclusion".
 sort -u "$RAW_IPS" \
-    | awk -F'\t' -v ex="$EXCLUDE_IP_FILE" \
-        'FILENAME == ex { skip[$1]=1; next } !($1 in skip)' "$EXCLUDE_IP_FILE" - \
+    | awk -F'\t' -v ex="$EXCLUDE_IP_FILE" -v dyn="$DYN_EXCLUDE" \
+        '(FILENAME == ex || FILENAME == dyn) { skip[$1]=1; next } !($1 in skip)' \
+        "$EXCLUDE_IP_FILE" "$DYN_EXCLUDE" - \
     > "$WORKDIR/cand.premask"
 if [[ -n "$EXCLUDE_RANGES" ]]; then
     grep -vE "^($EXCLUDE_RANGES)" "$WORKDIR/cand.premask" > "$CANDIDATES" || true
@@ -305,14 +334,14 @@ CUTOFF=$(date -d "-${RETENTION_DAYS} days" +"%Y-%m-%d")
 #    Exclusions are applied here too, so adding an IP to the exclude file
 #    RETROACTIVELY removes it from the lists on the next run - otherwise a
 #    mistakenly banned IP would linger for the full retention period.
-awk -F'|' -v cutoff="$CUTOFF" -v ex="$EXCLUDE_IP_FILE" '
-    FILENAME == ex { skip[$1]=1; next }
+awk -F'|' -v cutoff="$CUTOFF" -v ex="$EXCLUDE_IP_FILE" -v dyn="$DYN_EXCLUDE" '
+    (FILENAME == ex || FILENAME == dyn) { skip[$1]=1; next }
     {
         d=$4; gsub(/^[ \t]+|[ \t]+$/, "", d)
         ip=$1; gsub(/[ \t]/, "", ip)
         if (d >= cutoff && !(ip in skip)) print
     }
-' "$EXCLUDE_IP_FILE" "$TRAIL" > "$WORKDIR/trail.premask"
+' "$EXCLUDE_IP_FILE" "$DYN_EXCLUDE" "$TRAIL" > "$WORKDIR/trail.premask"
 if [[ -n "$EXCLUDE_RANGES" ]]; then
     grep -vE "^($EXCLUDE_RANGES)" "$WORKDIR/trail.premask" > "$WORKDIR/trail.pruned" || true
 else
@@ -369,10 +398,13 @@ if [[ "$APPLY_BANS" == "1" ]] && command -v ipset >/dev/null 2>&1 && command -v 
 
     # Excluded IPs are purged from the on-disk lists above, but an entry
     # already in the kernel set would otherwise live until its TTL expires.
-    # Delete them explicitly so exclusion takes effect immediately.
-    while read -r ip; do
+    # Delete them explicitly so exclusion takes effect immediately. This
+    # includes DDNS-resolved IPs: if your home IP changed and its new value
+    # got banned before the DDNS record caught up, it is unbanned here on
+    # the first run after the record updates.
+    sort -u "$EXCLUDE_IP_FILE" "$DYN_EXCLUDE" | while read -r ip; do
         [[ -n "$ip" ]] && ipset del "$IPSET_NAME" "$ip" 2>/dev/null
-    done < "$EXCLUDE_IP_FILE"
+    done
 
     # Subnet aggregation (reason #5): if SUBNET_THRESHOLD+ distinct IPs share
     # a /24, ban the whole /24 with a single hash:net entry.
